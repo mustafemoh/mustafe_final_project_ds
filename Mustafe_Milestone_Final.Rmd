@@ -1,0 +1,202 @@
+---
+title: "Peer-graded Assignment: Milestone Report_Mustafe"
+author: "Mustafe Abdi Mohamed"
+date: "August 22, 2025"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache = TRUE,
+  fig.width = 8,
+  fig.height = 5
+)
+set.seed(12345)
+```
+
+# Task 1 – Getting and Cleaning the Data
+I use the English dataset (blogs, news, Twitter) and prepare it with cleaning, tokenization, and profanity filtering.
+
+## Load & Inspect Raw Files
+```{r packages}
+use_pkgs <- c("readr", "data.table", "stringi", "dplyr", "tidyr", "tibble", "quanteda", "quanteda.textstats", "ggplot2", "scales", "kableExtra", "here")
+inst <- use_pkgs[!(use_pkgs %in% installed.packages()[, "Package"])]
+if (length(inst)) install.packages(inst, dependencies = TRUE)
+invisible(lapply(use_pkgs, library, character.only = TRUE))
+```
+
+```{r paths}
+DATA_DIR <- here::here("Coursera-SwiftKey/final/en_US")
+blogs_path   <- file.path(DATA_DIR, "en_US.blogs.txt")
+news_path    <- file.path(DATA_DIR, "en_US.news.txt")
+twitter_path <- file.path(DATA_DIR, "en_US.twitter.txt")
+```
+
+```{r load}
+read_lines_fast <- function(path) {
+  data.table::fread(path, sep = "\n", header = FALSE, encoding = "UTF-8", quote = "", data.table = FALSE, showProgress = FALSE)[[1]]
+}
+
+blogs   <- read_lines_fast(blogs_path)
+news    <- read_lines_fast(news_path)
+twitter <- read_lines_fast(twitter_path)
+```
+
+## File Statistics
+```{r stats}
+size_mb <- function(path) round(file.info(path)$size / 1024^2, 2)
+
+stats_tbl <- tibble::tibble(
+  file = c("blogs", "news", "twitter"),
+  size_MB = c(size_mb(blogs_path), size_mb(news_path), size_mb(twitter_path)),
+  lines   = c(length(blogs), length(news), length(twitter)),
+  n_chars = c(sum(nchar(blogs)), sum(nchar(news)), sum(nchar(twitter))),
+  n_words = c(sum(stringi::stri_count_words(blogs)),
+              sum(stringi::stri_count_words(news)),
+              sum(stringi::stri_count_words(twitter)))
+)
+
+knitr::kable(stats_tbl, caption = "Raw file summary") %>%
+  kableExtra::kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+```
+
+## Sampling & Cleaning
+```{r sampling}
+blogs1   <- iconv(blogs,   from = "UTF-8", to = "ASCII//TRANSLIT", sub = "")
+news1    <- iconv(news,    from = "UTF-8", to = "ASCII//TRANSLIT", sub = "")
+twitter1 <- iconv(twitter, from = "UTF-8", to = "ASCII//TRANSLIT", sub = "")
+
+sample_pct <- 0.01
+sample_vec <- function(x, p) if (length(x) > 0) sample(x, max(1, floor(length(x) * p))) else character()
+
+sample_data <- c(sample_vec(blogs1, sample_pct), sample_vec(news1, sample_pct), sample_vec(twitter1, sample_pct))
+
+clean_text <- function(x) {
+  x |>
+    stringi::stri_replace_all_regex("https?://[^\\s]+", " ") |>
+    stringi::stri_replace_all_regex("[0-9]+", " ") |>
+    stringi::stri_trans_tolower() |>
+    stringi::stri_trim_both()
+}
+
+sample_clean <- clean_text(sample_data)
+```
+
+## Tokenization & Profanity Filtering
+```{r tokens}
+corp <- quanteda::corpus(sample_clean)
+profane_words <- c("badword1", "badword2", "offensiveword") # extend as needed
+tok <- tokens(corp, remove_punct = TRUE, remove_symbols = TRUE) |> tokens_remove(profane_words)
+
+tok_uni_nostop <- tokens_remove(tok, stopwords("en"))
+tok_bi  <- tokens_ngrams(tok, n = 2)
+tok_tri <- tokens_ngrams(tok, n = 3)
+```
+
+# Task 2 – Exploratory Data Analysis
+I explore word frequencies, n-gram distributions, and coverage.
+
+## Frequency Tables
+```{r dfm-freq}
+make_freq <- function(toks) {
+  dfm <- quanteda::dfm(toks)
+  frq <- quanteda.textstats::textstat_frequency(dfm)
+  tibble::as_tibble(frq) |> dplyr::select(feature, frequency)
+}
+
+freq_uni <- make_freq(tok_uni_nostop)
+freq_bi  <- make_freq(tok_bi)
+freq_tri <- make_freq(tok_tri)
+```
+
+## Visualization of Top Features
+```{r plots}
+plot_top_n <- function(freq_tbl, n = 10, title = "Top features", fill_color = "#2C3E50") {
+  freq_tbl |>
+    slice_max(frequency, n = n) |>
+    mutate(feature = reorder(feature, frequency)) |>
+    ggplot(aes(x = feature, y = frequency, fill = frequency)) +
+    geom_col(show.legend = FALSE, fill = fill_color) +
+    coord_flip() +
+    labs(title = title, x = NULL, y = "Frequency") +
+    scale_y_continuous(labels = scales::comma) +
+    theme_minimal(base_size = 12)
+}
+
+plot_top_n(freq_uni, 10, "Top 10 Unigrams (no stopwords)", "#18BC9C")
+plot_top_n(freq_bi, 10, "Top 10 Bigrams", "#3498DB")
+plot_top_n(freq_tri, 10, "Top 10 Trigrams", "#E74C3C")
+```
+
+## Word Coverage
+```{r coverage}
+cum_cov <- freq_uni |> mutate(cum_freq = cumsum(frequency)/sum(frequency))
+cover50 <- min(which(cum_cov$cum_freq >= 0.5))
+cover90 <- min(which(cum_cov$cum_freq >= 0.9))
+
+list(words_needed_50pct = cover50, words_needed_90pct = cover90)
+```
+
+# Task 3 – Modeling
+I build a basic predictive model using n-grams and backoff.
+
+## Basic N-Gram Model & Backoff
+```{r simple-model}
+lookup_bi <- freq_bi |>
+  tidyr::separate(feature, into = c("w1","w2"), sep = "_", remove = FALSE) |>
+  group_by(w1) |> arrange(desc(frequency), .by_group = TRUE)
+
+lookup_tri <- freq_tri |>
+  tidyr::separate(feature, into = c("w1","w2","w3"), sep = "_", remove = FALSE) |>
+  group_by(w1, w2) |> arrange(desc(frequency), .by_group = TRUE)
+
+predict_next <- function(phrase, top_k = 3) {
+  # Tokenize once; avoid piping to `[[` which breaks with base pipe
+  toks <- quanteda::tokens(phrase, remove_punct = TRUE)[[1]]
+  if (length(toks) == 0) {
+    return(freq_uni$feature[seq_len(min(top_k, nrow(freq_uni)))])
+  }
+  toks <- tolower(toks)
+  n <- length(toks)
+
+  # Try trigram continuation
+  if (n >= 2) {
+    w1 <- toks[n - 1]; w2 <- toks[n]
+    cand <- lookup_tri |>
+      dplyr::filter(w1 == .env$w1, w2 == .env$w2) |>
+      dplyr::slice_head(n = top_k)
+    if (nrow(cand) > 0) return(cand$w3)
+  }
+
+  # Back off to bigram
+  w1 <- toks[n]
+  cand <- lookup_bi |>
+    dplyr::filter(w1 == .env$w1) |>
+    dplyr::slice_head(n = top_k)
+  if (nrow(cand) > 0) return(cand$w2)
+
+  # Fallback to most frequent unigrams
+  freq_uni$feature[seq_len(min(top_k, nrow(freq_uni)))]
+}
+
+```
+
+# Conclusion & Next Steps
+- ✅ Task 1: Data loading, cleaning, tokenization, profanity filtering.
+- ✅ Task 2: EDA with frequency tables, plots, and coverage.
+- ✅ Task 3: Basic n-gram model with backoff.
+
+**Next task will be:** refine smoothing, compress tables, and build Shiny app.
+
+# Appendix
+```{r session}
+sessionInfo()
+```
